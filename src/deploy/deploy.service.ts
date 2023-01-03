@@ -10,6 +10,7 @@ import { collection, getDocs, getFirestore, doc, updateDoc, where, query } from 
 import { DeployRequest } from "./models/DeployRequest";
 import * as os from "os";
 import { join } from "path";
+import { Credentials } from "../db-manage/models/Credentials";
 
 const firebaseConfig = {
   apiKey: "AIzaSyBUfFIFHzEuLb_BOVDmmYR867imxO_ZVKs",
@@ -97,7 +98,68 @@ export class DeployService {
           });
       }*/
 
-  async uploadImage(imageName: string) {
+  async getURL(projectId:string){
+    const child = spawn('cd src/deploy/deploy-tf/example && terraform output -json',{shell:true});
+
+    child.stdout.on('data', async (data) => {
+      const output = JSON.parse(data);
+      const { hello_output } = output
+
+      await this.updateStateProject(projectId, {
+        state: "Deployed",
+        app_url:hello_output.value
+      });
+
+      console.log(`stdout: ${data}`);
+    });
+
+    child.stderr.on('data', (data) => {
+      console.log(`stderr: ${data}`);
+    });
+
+    child.on('error', (error) => console.log(`error: ${error.message}`));
+
+    child.on('exit', (code, signal) => {
+      if (code) console.log(`Process exit with code: ${code}`);
+      if (signal) console.log(`Process killed with signal: ${signal}`);
+      console.log(`Done, deployed ✅`);
+      fs.rm('src/repo', { recursive: true }, () => console.log('done'));
+    });
+  }
+
+  async deploy(imageName: string, appName:string,projectId:string){
+    await this.updateStateProject(projectId, {
+      state:"Deploying with terraform..."
+    });
+    const changeState=`terraform init -reconfigure -backend-config="key=${imageName}"`;
+    const apply=` terraform apply --auto-approve -var="ecs_image=${imageName}" -var="name=${appName}"`
+    const child = spawn(`cd src/deploy/deploy-tf/example && ${changeState} && ${apply}`,{ shell: true });
+
+    child.stdout.on("data", async (data) => {
+      console.log(`stdout: ${data}`);
+    });
+
+    child.stderr.on("data", (data) => {
+      console.log(`stderr: ${data}`);
+    });
+
+    child.on("error", (error) => console.log(`error: ${error.message}`));
+
+    child.on("exit", async (code, signal) => {
+      if (code) console.log(`Process exit with code: ${code}`);
+      if (signal) console.log(`Process killed with signal: ${signal}`);
+      console.log(`Done ✅`);
+      if (!code && !signal) {
+        await this.getURL(projectId);
+      }
+      fs.rm('src/repo', { recursive: true }, () => console.log('done'));
+    });
+  }
+
+  async uploadImage(imageName: string,appName:string,projectId:string) {
+    await this.updateStateProject(projectId, {
+      state:"Uploading image to ECR..."
+    });
     const child = spawn(`aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 546326832472.dkr.ecr.us-east-1.amazonaws.com && docker tag ${imageName}:latest 546326832472.dkr.ecr.us-east-1.amazonaws.com/repositories:${imageName} && docker push 546326832472.dkr.ecr.us-east-1.amazonaws.com/repositories:${imageName}`,{ shell: true });
 
     child.stdout.on("data", (data) => {
@@ -110,16 +172,23 @@ export class DeployService {
 
     child.on("error", (error) => console.log(`error: ${error.message}`));
 
-    child.on("exit", (code, signal) => {
+    child.on("exit", async (code, signal) => {
       if (code) console.log(`Process exit with code: ${code}`);
       if (signal) console.log(`Process killed with signal: ${signal}`);
       console.log(`Done ✅`);
+      if (!code && !signal) {
+        await this.deploy(imageName, appName, projectId);
+      }
     });
   }
 
-  async buildImage(project: any, folder: string) {
+  async buildImage(project: any, folder: string,username:string) {
+    await this.updateStateProject(project.id, {
+      state:"Building docker image..."
+    });
     const imageName=`${project.owner_id}-${project.repository}-${project.branch}`.toLowerCase();
-    const dockerFile=join(folder,'Dockerfile')
+    const appName=`${username}-${project.repository}`
+    //const dockerFile=join(folder,'Dockerfile')
     //const child = spawn(`docker build -t ${imageName} . -f ${dockerFile}`,{ shell: true });
     const child = spawn(`cd src/repo && docker build -t ${imageName} .`,{ shell: true });
 
@@ -138,20 +207,22 @@ export class DeployService {
       if (signal) console.log(`Process killed with signal: ${signal}`);
       console.log(`Done ✅`);
       if (!code && !signal) {
-        await this.uploadImage(imageName);
+        await this.uploadImage(imageName,appName,project.id);
       }
     });
   }
 
-  async cloneRepository(project: any) {
-    let tmpDir;
+  async cloneRepository(project: any,username:string) {
+    await this.updateStateProject(project.id, {
+      state:"Cloning repository..."
+    });
+    let tmpDir='src/repo';
     const appPrefix = project.repository;
     try {
-      const folderPath = join(os.tmpdir() + "/" + appPrefix);
-      tmpDir = fs.mkdtempSync(folderPath);
-      console.log(tmpDir);
+     // const folderPath = join(os.tmpdir() + "/" + appPrefix);
+      //fs.mkdirSync('./src/repo');
       //const child = spawn(`git clone ${project.repository_url} ${'src/repo'}`, { shell: true });
-      const child = spawn(`cd src/repo && git clone ${project.repository_url}`, { shell: true });
+      const child = spawn(`cd src/repo && git clone ${project.repository_url} .`, { shell: true });
 
 
       child.stdout.on("data", (data) => {
@@ -169,7 +240,7 @@ export class DeployService {
         if (signal) console.log(`Process killed with signal: ${signal}`);
         console.log(`Done ✅`);
         if (!code && !signal) {
-          await this.buildImage(project, tmpDir);
+          await this.buildImage(project, tmpDir,username);
         }
       });
 
@@ -177,23 +248,23 @@ export class DeployService {
       console.error(e);
     } finally {
       try {
-        if (tmpDir) {
-          //fs.rmSync(tmpDir, { recursive: true });
-        }
+       // if (tmpDir) {
+          //fs.rmSync('src/repo', { recursive: true });
+        //}
       } catch (e) {
         console.error(`An error has occurred while removing the temp folder at ${tmpDir}. Please remove it manually. Error: ${e}`);
       }
     }
   }
 
-  async updateStateProject(id: string, state: string) {
+  async updateStateProject(id: string, state: any) {
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
 
     const dbRef = doc(db, "projects", id);
 
     await updateDoc(dbRef, {
-      state
+      ...state
     });
   }
 
@@ -228,20 +299,48 @@ export class DeployService {
     return user;
   }
 
+  createRepoFolder(){
+    const path = "src/repo";
+
+    fs.access(path, (error) => {
+
+      // To check if given directory
+      // already exists or not
+      if (error) {
+        // If current directory does not exist then create it
+        fs.mkdir(path, { recursive: true }, (error) => {
+          if (error) {
+            console.log(error);
+          } else {
+            console.log("New Directory created successfully !!");
+          }
+        });
+      } else {
+        console.log("Given Directory already exists !!");
+      }
+    });
+  }
 
   @SqsMessageHandler(config.DEPLOY_QUEUE_NAME, false)
   async handleMessage(message: AWS.SQS.Message) {
     try {
       const deployRequest: DeployRequest = JSON.parse(message.Body) as DeployRequest;
       const project = await this.getProject(deployRequest.repositoryUrl);
-      const user = await this.getUser(deployRequest.username);
-      await this.updateStateProject(project.id, "deploying...");
-      await this.cloneRepository(project);
+      //const user = await this.getUser(deployRequest.username);
+      await this.updateStateProject(project.id, {
+        state:"Deploying..."
+      });
 
+      this.createRepoFolder();
+
+      await this.cloneRepository(project,deployRequest.username);
+      //await this.getURL("PRID2e24d21c7b8a4145841910c2fd59e5e1")
 
       console.log(message);
     } catch (e) {
       console.log(e);
+    }finally {
+      //fs.rm('src/repo', { recursive: true }, () => console.log('done'));
     }
   }
 }

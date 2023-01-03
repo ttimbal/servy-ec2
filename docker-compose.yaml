@@ -1,0 +1,11 @@
+version: '1'
+
+services:
+  pdf-loader:
+    image: db-manager
+    container_name: db-manager
+    env_file:
+      - .env
+    build: .
+    ports:
+      - 2000:2000
